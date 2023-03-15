@@ -4,7 +4,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import zip_longest
-from typing import Any, Union
+import logging
+from typing import Any, Union, Literal
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -31,6 +32,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from huawei_solar import HuaweiSolarBridge
 from huawei_solar import register_names as rn
 from huawei_solar import register_values as rv
+from huawei_solar.exceptions import HuaweiSolarException
 from huawei_solar.files import OptimizerRunningStatus
 from huawei_solar.registers import (
     ChargeDischargePeriod,
@@ -55,6 +57,8 @@ from .const import (
 
 PARALLEL_UPDATES = 1
 
+LOGGER = logging.getLogger(__name__)
+
 
 @dataclass
 class HuaweiSolarSensorEntityDescription(SensorEntityDescription):
@@ -63,9 +67,74 @@ class HuaweiSolarSensorEntityDescription(SensorEntityDescription):
     value_conversion_function: Callable[[Any], str] | None = None
 
 
+@dataclass
+class HuaweiSolarExtraSensorEntityDescription(HuaweiSolarSensorEntityDescription):
+    """Huawei Solar Extra Sensor Entity."""
+
+    owner: Literal["inverter", "power_meter", "connected_energy_storage"] = "inverter"
+
+
+# Add any extra sensors you want to keep track of here:
+
+EXTRA_SENSOR_DESCRIPTIONS: tuple[HuaweiSolarExtraSensorEntityDescription, ...] = (
+    HuaweiSolarExtraSensorEntityDescription(
+        key=rn.INSULATION_RESISTANCE,
+        name="Insulation resistance",
+        native_unit_of_measurement="Ohm",
+        device_class=None,  # there is no relevant SensorDeviceClass for resistance values
+        state_class=SensorStateClass.MEASUREMENT,
+        owner="inverter",
+    ),
+    HuaweiSolarExtraSensorEntityDescription(
+        key=rn.STORAGE_UNIT_1_BATTERY_TEMPERATURE,
+        name="Battery 1 temperature",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        owner="connected_energy_storage",
+    ),
+)
+
+
+class HuaweiSolarExtraSensorEntity(HuaweiSolarEntity, SensorEntity):
+    """Extra user-defined sensor."""
+
+    entity_description: HuaweiSolarSensorEntityDescription
+
+    def __init__(
+        self,
+        bridge: HuaweiSolarBridge,
+        description: HuaweiSolarExtraSensorEntityDescription,
+        device_infos: dict,
+    ) -> None:
+        """Extra Huawei Solar Sensor Entity constructor."""
+        self.bridge = bridge
+        self.entity_description = description
+
+        self._attr_device_info = device_infos[description.owner]
+        self._attr_unique_id = f"{bridge.serial_number}_{description.key}"
+
+        self._register_key = self.entity_description.key
+
+    async def async_update(self):
+        """Handle updated data from the coordinator."""
+        try:
+            register = await self.bridge.client.get(self._register_key)
+            value = register.value
+            if self.entity_description.value_conversion_function:
+                value = self.entity_description.value_conversion_function(value)
+
+            self._attr_native_value = value
+            self._attr_available = True
+
+        except HuaweiSolarException:
+            LOGGER.exception("Update failed for extra register %s", self._register_key)
+            self._attr_native_value = None
+            self._attr_available = False
+
+
 # Every list in this file describes a group of entities which are related to each other.
 # The order of these lists matters, as they need to be in ascending order wrt. to their modbus-register.
-
 
 INVERTER_SENSOR_DESCRIPTIONS: tuple[HuaweiSolarSensorEntityDescription, ...] = (
     HuaweiSolarSensorEntityDescription(
@@ -708,6 +777,11 @@ async def async_setup_entry(
 
         bridge = update_coordinator.bridge
         device_infos = update_coordinator.device_infos
+
+        for entity_description in EXTRA_SENSOR_DESCRIPTIONS:
+            slave_entities.append(
+                HuaweiSolarExtraSensorEntity(bridge, entity_description, device_infos)
+            )
 
         for entity_description in INVERTER_SENSOR_DESCRIPTIONS:
             slave_entities.append(
